@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+#import roslib
+import time
+from depthai_ros_msgs.msg import SpatialDetectionArray
+from std_msgs.msg import String,Int16,Float32,Float32MultiArray,Bool,ColorRGBA
+from geometry_msgs.msg import Point
+from visualization_msgs.msg import Marker
+from sensor_msgs.msg import CompressedImage, Image, JointState
+from std_srvs.srv import Trigger, TriggerResponse
+import os
+from cv_bridge import CvBridge, CvBridgeError
+import tf
+
+import actionlib
+from control_msgs.msg import *
+from trajectory_msgs.msg import *
+from math import pi
+
+import rospy, sys, numpy as np
+from copy import deepcopy
+import geometry_msgs.msg
+import moveit_msgs.msg
+
+from std_msgs.msg import Header
+from trajectory_msgs.msg import JointTrajectory
+from trajectory_msgs.msg import JointTrajectoryPoint
+
+
+class OakD:
+	def __init__(self,namespace):
+		self.delta_time=0.1
+		self.yolo_order_by="obj.position.z"
+		self.yolo_classes=[0,1,2]
+		self.yolo_order=[0,1,2]
+		self.yolo_len=len(self.yolo_order)
+		self.yolo_marker_colors=[ColorRGBA(1, 0.4, 0.4, 1),ColorRGBA(0.4, 1, 0.4, 1)]
+		self.yolo_marker_status=[]
+		self.yolo_marker_status_colors=[]
+		self.yolo_marker_status_points=[]
+		self.yolo_last_user_order=self.yolo_order
+		#position of objects in robot ordered by self.yolo_classes
+		self.yolo_obj_position=["right","center","left"]
+
+		self.yolo_prog_sequence=""
+		#rospy.Subscriber('/move_end', String, self.cb_new_move_sequence)
+		#rospy.Subscriber("/simple_move", String, self.cb_new_move)
+		rospy.Subscriber("/oak/object_det/objects/detections", SpatialDetectionArray, self.cb_yolo, queue_size=1)
+		rospy.Subscriber("/oak/user/hands/gesture", String, self.cb_hand_gesture, queue_size=1)
+		self.gripper=0
+		self.start_sequence= rospy.Publisher("/start_sequence", String, queue_size=1)
+		self.simple_move= rospy.Publisher("/simple_move", String, queue_size=1)
+		self.set_delta= rospy.Publisher("/set_delta", Float32, queue_size=1)
+		self.yolo_order_pub= rospy.Publisher("/yolo_good_order", Bool, queue_size=1)
+
+
+		self.pose_index=0
+		
+	def cb_set_delta(self,data):
+		rospy.loginfo("cb_set_delta - I heard %d", data)
+		self.delta_time=data.data
+	def cb_hand_gesture(self,data):
+		#rospy.loginfo("cb_hand_gesture - I heard %s", data)
+		if data.data=='FIVE':
+			self.gripper=0
+		elif data.data=='ONE':
+			self.yolo_prog_sequence="takeprog"+self.yolo_obj_position[self.yolo_order[0]]
+			rospy.loginfo("self.yolo_prog_sequence - %s", self.yolo_prog_sequence)
+			self.start_sequence.publish(self.yolo_prog_sequence)
+		elif data.data=='PEACE':
+			self.yolo_prog_sequence="takeprog"+self.yolo_obj_position[self.yolo_order[1]]
+			rospy.loginfo("self.yolo_prog_sequence - %s", self.yolo_prog_sequence)
+			self.start_sequence.publish(self.yolo_prog_sequence)
+		elif data.data=='THREE':
+			self.yolo_prog_sequence="takeprog"+self.yolo_obj_position[self.yolo_order[2]]
+			rospy.loginfo("self.yolo_prog_sequence - %s", self.yolo_prog_sequence)
+			self.start_sequence.publish(self.yolo_prog_sequence)
+		elif data.data=='TWO':
+			self.yolo_order=self.yolo_last_user_order
+		elif data.data=='FIST':
+			self.gripper=3.14
+	'''def cb_hand_screen_pos(self,data):
+		#rospy.loginfo("cb_hand_screen_pose - I heard %f", data.data[0])
+		#rospy.loginfo("hand_screen_pose size - I heard %d", len(data.data))
+		#for numero in data.data:
+		#	rospy.loginfo("%f", numero)
+		nuevo_mensaje=String()
+		q1=(0.5-data.data[0])*5.5 #3.14
+		q2=(0.5-data.data[1])*2
+		nuevo_mensaje.data=str(q1)+" "+str(-q2)+ " 0 "+str(self.gripper)
+		rospy.loginfo(nuevo_mensaje)
+		#self.cb_new_move(nuevo_mensaje)
+		self.simple_move.publish(nuevo_mensaje)
+	'''
+	def sorter(self,e):
+		#print(e.position.z)
+		return e.position.z
+	def cb_yolo(self,data):
+		#rospy.loginfo("Yolo data! Yuju! ")
+		#self.yolo_data=data
+		obj_list=[d for d in data.detections if d.results[0].id in self.yolo_classes]
+		obj_list_unsorted=[]
+		for obj in obj_list:
+			obj_list_unsorted.append(obj.results[0].id)
+		print("unsorted list")
+		print(obj_list_unsorted)
+		# sort list by self.yolo_order_by
+		obj_list.sort(key=self.sorter)
+		print("sorted list")
+		obj_list_sorted=[]
+		for obj in obj_list:
+			obj_list_sorted.append(obj.results[0].id)
+		print(obj_list_sorted)
+		print("Good sorting")
+		print(self.yolo_order)
+		check_status=[]
+		if(self.yolo_len==len(obj_list_sorted)):
+			self.yolo_last_user_order=obj_list_sorted
+			for i in range(len(self.yolo_order)):
+				check_status.append(self.yolo_order[i]==obj_list_sorted[i])
+
+		print("Result:")
+		print(check_status)
+		self.yolo_marker_status=[int(d) for d in check_status]
+		result_msg=Bool()
+		if self.yolo_order==obj_list_sorted:
+			result_msg.data=True
+		else:
+			result_msg.data=False
+		print(result_msg.data)
+		self.yolo_marker_status_colors=[self.yolo_marker_colors[d] for d in self.yolo_marker_status]
+		self.yolo_marker_status_points=[Point(obj.position.x,-obj.position.y,obj.position.z) for obj in obj_list]
+		self.yolo_order_pub.publish(result_msg)
+		
+	def print_points(self,frame):#, points, frame):
+	    rate = rospy.Rate(5)
+	    marker = Marker()
+	    marker.header.frame_id = "oak_scene_right_camera_optical_frame"
+	    marker.type = marker.SPHERE_LIST
+	    marker.action = marker.ADD
+	    marker.pose.orientation.w = 1
+	    pub = rospy.Publisher(frame, Marker, queue_size = 100)
+	    t = rospy.Duration()
+	    marker.lifetime = t
+	    marker.scale.x = 0.1
+	    marker.scale.y = 0.1
+	    marker.scale.z = 0.1
+	    marker.color.a = 1.0
+
+	    #iterations = 0
+	    while not rospy.is_shutdown():
+		    marker.points = self.yolo_marker_status_points
+		    marker.colors=self.yolo_marker_status_colors
+		    pub.publish(marker)
+		    #iterations += 1
+		    rate.sleep()
+
+		
+def main():
+	'''Initializes and cleanup ros node'''
+	rospy.init_node('oakD_process', anonymous=True)
+	rate = rospy.Rate(1)
+	cc = OakD("")
+	cc.print_points("/testmap")
+	rospy.spin()
+		
+
+if __name__ == '__main__':
+	main()
+
